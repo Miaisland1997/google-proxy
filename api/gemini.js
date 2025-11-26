@@ -2,92 +2,158 @@ import axios from 'axios';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// 你自定义的sk-密钥白名单
+// 自定义的sk-密钥白名单 - 你可以修改这些密钥
 const validSkKeys = new Set([
   'sk-gemini-proxy-12345',
   'sk-vercel-gemini-67890',
-  'sk-my-gemini-proxy'
+  'sk-my-custom-key-2024'
 ]);
 
 export default async function handler(request, response) {
-  // 设置CORS
+  // 设置CORS头
   response.setHeader('Access-Control-Allow-Origin', '*');
-  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   
+  // 处理预检请求
   if (request.method === 'OPTIONS') {
     return response.status(200).end();
   }
   
+  // 健康检查端点
+  if (request.method === 'GET' && request.url === '/api/gemini') {
+    return response.status(200).json({
+      status: 'active',
+      service: 'Gemini Proxy',
+      message: 'Service is running. Use POST method for API calls.',
+      valid_key_example: 'sk-gemini-proxy-12345',
+      usage: 'Send POST request with Authorization: Bearer sk-xxx'
+    });
+  }
+  
   try {
-    // 1. 验证sk-格式密钥
+    // 验证请求方法
+    if (request.method !== 'POST') {
+      return response.status(405).json({
+        error: 'Method not allowed',
+        message: 'Only POST requests are supported for API calls'
+      });
+    }
+    
+    // 验证Authorization头
     const authHeader = request.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return response.status(401).json({ 
-        error: 'Missing API key',
-        hint: 'Use Authorization: Bearer sk-xxx in header' 
+    if (!authHeader) {
+      return response.status(401).json({
+        error: 'Missing Authorization header',
+        message: 'Please include: Authorization: Bearer sk-your-key-here'
+      });
+    }
+    
+    if (!authHeader.startsWith('Bearer ')) {
+      return response.status(401).json({
+        error: 'Invalid Authorization format',
+        message: 'Must be: Bearer sk-xxx'
       });
     }
     
     const clientSkKey = authHeader.replace('Bearer ', '');
+    
+    // 验证sk-密钥
     if (!validSkKeys.has(clientSkKey)) {
-      return response.status(401).json({ 
+      return response.status(401).json({
         error: 'Invalid API key',
-        valid_keys: Array.from(validSkKeys) 
+        message: 'The provided API key is not valid',
+        valid_keys: Array.from(validSkKeys),
+        hint: 'Use one of the keys from valid_keys array'
       });
     }
     
-    // 2. 获取请求数据
-    const { messages, model, stream } = request.body;
-    
-    console.log('Received request:', { messages, model });
-    
+    // 检查环境变量
     if (!GEMINI_API_KEY) {
-      return response.status(500).json({ 
-        error: 'Server misconfiguration',
-        message: 'Gemini API key not set in environment variables' 
+      return response.status(500).json({
+        error: 'Server configuration error',
+        message: 'Gemini API key is not configured on the server'
       });
     }
     
-    // 3. 将OpenAI格式转换为Gemini格式
+    // 解析请求体
+    let requestBody;
+    try {
+      requestBody = request.body;
+    } catch (parseError) {
+      return response.status(400).json({
+        error: 'Invalid JSON body',
+        message: 'Request body must be valid JSON'
+      });
+    }
+    
+    const { messages, model, stream, max_tokens, temperature } = requestBody;
+    
+    // 验证必需字段
+    if (!messages || !Array.isArray(messages)) {
+      return response.status(400).json({
+        error: 'Missing required field',
+        message: 'The "messages" array is required'
+      });
+    }
+    
+    // 构建Gemini请求格式
+    const geminiContents = messages.map(msg => {
+      // 转换角色名称
+      let role = 'user';
+      if (msg.role === 'assistant' || msg.role === 'system') {
+        role = 'model';
+      }
+      
+      return {
+        parts: [{ text: msg.content || '' }],
+        role: role
+      };
+    });
+    
     const geminiData = {
-      contents: messages.map(msg => ({
-        parts: [{ text: msg.content }],
-        role: msg.role === 'user' ? 'user' : 'model'
-      })),
+      contents: geminiContents,
       generationConfig: {
-        temperature: 0.7,
+        temperature: temperature || 0.7,
         topK: 40,
         topP: 0.95,
-        maxOutputTokens: 1024,
+        maxOutputTokens: max_tokens || 1024,
       }
     };
     
-    // 4. 调用真实的Gemini API
+    // 调用Gemini API
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${GEMINI_API_KEY}`;
     
-    console.log('Calling Gemini API...');
     const geminiResponse = await axios.post(geminiUrl, geminiData, {
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+      },
       timeout: 30000
     });
     
-    // 5. 将Gemini响应转换回OpenAI格式
+    // 处理Gemini响应
+    if (!geminiResponse.data.candidates || !geminiResponse.data.candidates[0]) {
+      throw new Error('No response from Gemini API');
+    }
+    
     const geminiText = geminiResponse.data.candidates[0].content.parts[0].text;
     
-    const openAIFormatResponse = {
-      id: "gemini-" + Date.now(),
+    // 构建OpenAI兼容的响应格式
+    const openAIResponse = {
+      id: "chatcmpl-" + Math.random().toString(36).substring(2),
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
-      model: "gemini-pro",
-      choices: [{
-        index: 0,
-        message: {
-          role: "assistant",
-          content: geminiText
-        },
-        finish_reason: "stop"
-      }],
+      model: model || "gemini-pro",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: geminiText
+          },
+          finish_reason: "stop"
+        }
+      ],
       usage: {
         prompt_tokens: 0,
         completion_tokens: 0,
@@ -95,17 +161,32 @@ export default async function handler(request, response) {
       }
     };
     
-    console.log('Successfully proxied request');
-    response.json(openAIFormatResponse);
+    // 返回成功响应
+    response.status(200).json(openAIResponse);
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
-    console.error('Error details:', error.response?.data);
+    console.error('Gemini Proxy Error:', error.message);
     
-    response.status(500).json({ 
-      error: 'Proxy failed', 
-      message: error.message,
-      details: error.response?.data 
-    });
+    // 更详细的错误处理
+    if (error.response) {
+      // Gemini API返回的错误
+      response.status(error.response.status).json({
+        error: 'Gemini API error',
+        message: error.message,
+        details: error.response.data
+      });
+    } else if (error.request) {
+      // 网络错误
+      response.status(503).json({
+        error: 'Network error',
+        message: 'Cannot connect to Gemini API'
+      });
+    } else {
+      // 其他错误
+      response.status(500).json({
+        error: 'Proxy error',
+        message: error.message
+      });
+    }
   }
 }
