@@ -1,7 +1,8 @@
 export default async function handler(request, response) {
-  return response.json({ 
+  console.log('Health check called');
+  return response.status(200).json({ 
     status: 'OK', 
-    message: 'Google Proxy is running!',
-    timestamp: new Date().toISOString()
+    message: 'Google Proxy is working!',
+    path: request.url
   });
 }
